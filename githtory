@@ -1,0 +1,274 @@
+#!/bin/bash
+GH_DIR="$HOME/.githtory"
+GH_PWD="$PWD"
+GH_ENV="$(env|base64)"
+GH_NUM=
+
+function gh_die(){
+	printf '%s\n' "$*" >&2
+	return 1
+}
+
+function gh_git(){
+	GIT_DIR="$GH_DIR" git "$@"
+}
+
+function gh_session(){
+	printf '%s %s %s %s\n' \
+		"$HOSTNAME" \
+		"$$" \
+		"$(ps -o 'ppid=' $$)" \
+		"$(date -d"$(ps -o 'lstart=' $$)" +'%s %z')" \
+	|
+	gh_git hash-object --stdin -w
+}
+
+function gh_ref(){
+	if [ -n "$GH_SESSION" ]; then
+		gh_git cat-file blob "$GH_SESSION"|
+		awk '{print "refs/heads/" $1 "/" $4 "/" $2}'
+	fi
+}
+
+function gh_initialized_or_die(){
+	test -d "$GH_DIR" ||
+	{
+#		gh_die 'githtory not initialized'
+		return 1
+	}
+}
+
+function gh(){
+	test -d "$GH_DIR" ||
+	{
+		gh_die 'githtory not initialized'
+		return 1
+	}
+
+	case "$1" in
+        init)
+            [ -d "$GH_DIR" ] && {
+                gh_die 'githtory already initialized'
+                return 1
+            }
+            gh_git init --bare
+            ;;
+		ready)
+			local id="$2"
+			local cmd="$(gh_git cat-file blob "$id:command")"
+			builtin history -s "$cmd"
+			return "$?"
+			;;
+		forget-session)
+			GH_LAST=
+			gh_git update-ref -d "$(gh_ref)"
+			;;
+		reset)
+			local ref="$(gh_ref)"
+			[ -z "$ref" ] && return 1
+
+			gh_git update-ref "$ref" "$2" || return 1
+			GH_LAST="$(gh_git rev-parse "$ref")"
+			;;
+		delete)
+			shift
+			local ref="$(gh_ref)"
+
+			local revs=()
+			local negatives=()
+			if [ $# -lt 1 ]; then
+				[ -z "$ref" ] && return 1
+				revs=( "$(gh_git rev-parse "$ref")" )
+			elif [ "$(gh_git rev-parse "$@" | wc -l)" = "1" ]; then
+				revs=( "$(gh_git rev-parse "$@")" )
+			else
+				negatives=( $(gh_git rev-parse "$@"|grep '^\^') )
+				local rev
+				while read rev; do
+					revs[${#revs[@]}]="$rev"
+				done < <(gh_git rev-list "$@")
+			fi
+
+			if [ ${#revs[@]} -lt 1 ]; then
+				gh_die 'unable to determine what to delete'
+				return 1
+			fi
+
+			local tests='-z "$GIT_COMMIT"'
+			local rev
+			for rev in "${revs[@]}"; do
+				tests="$tests -o "'"$GIT_COMMIT" = "'"$rev"'"'
+			done
+
+			local candidates=()
+			if [ -n "$ref" ]; then
+				candidates[${#candidates[@]}]="$ref"
+			fi
+			if gh_git rev-parse --verify -q "refs/heads/combined" >/dev/null; then
+				candidates[${#candidates[@]}]="refs/heads/combined"
+			fi
+
+			local refs=()
+			for can in "${candidates[@]}"; do
+				local neg
+				for neg in "${negatives[@]}"; do
+					if [ \
+						"$(gh_git merge-base "${neg#^}" "$can")" = \
+						"${neg#^}" \
+					]; then
+						refs[${#refs[@]}]="$can"
+						break
+					fi
+				done
+				
+			done
+
+			local update_ref=
+			[ ${#refs[@]} -lt 1 ] && return 1
+
+			gh_git filter-branch -f --commit-filter '
+				if [ '"$tests"' ]; then
+					skip_commit "$@"
+				else
+					git commit-tree "$@"
+				fi
+			' "${negatives[@]}" "${refs[@]}"
+			[ -n "$ref" ] && GH_LAST="$(gh_git rev-parse --verify -q "$ref")"
+			;;
+		*)
+			local session_ref="$(gh_ref)"
+			local ref=
+			if \
+				[ -n "$session_ref" ] &&
+				gh_git rev-parse --verify -q "$session_ref" >/dev/null
+			then
+				ref="$session_ref"
+			elif [ -n "$GH_BASE" ]; then
+				ref="$GH_BASE"
+			elif gh_git rev-parse --verify -q refs/heads/combined >/dev/null; then
+				ref=refs/heads/combined
+			else
+				return 1
+			fi
+
+			gh_git \
+				-c 'log.decorate=false' \
+				-c 'core.pager=cat' \
+				log --oneline --no-merges --reverse "$@" "$ref"
+		;;
+	esac
+}
+
+function gh_append(){
+	gh_initialized_or_die || return 1
+	gh_automerge
+	local num="$(history 1 | sed -n '1s/^[^0-9]*\([0-9]*\).*/\1/p')"
+	[ -z "$GH_NUM" ] && {
+		GH_NUM="$num"
+		return 0
+	}
+	[ -z "$num" -o "$num" = "$GH_NUM" ] && return 0
+	[ -z "$GH_SESSION" ] && GH_SESSION="$(gh_session)"
+	[ -n "$GH_SESSION" ] || {
+		gh_die 'failed to initialize session'
+		return 1
+	}
+
+	local idx="$(mktemp -t 'GITHTORY-INDEX.XXXXXXXXXX')"
+	[ -n "$idx" -a -w "$idx" ] || {
+		gh_die 'unable to create temporary githtory index'
+		return 1
+	}
+	GIT_INDEX_FILE="$idx" gh_git read-tree --empty || {
+		rm -f "$idx"
+		gh_die 'unable to initialize temporary githtory index'
+		return 1
+	}
+	local cmd="$(history 1 | sed '1s/^[^0-9]*[0-9]* *//'| gh_git hash-object --stdin -w)"
+	local usr="$(printf '%s\n' "$USERNAME" | gh_git hash-object --stdin -w)"
+	local hst="$(printf '%s\n' "$HOSTNAME" | gh_git hash-object --stdin -w)"
+	local pwd="$(printf '%s\n' "$GH_PWD" | gh_git hash-object --stdin -w)"
+	local env="$(printf '%s\n' "$GH_ENV" | base64 -d | gh_git hash-object --stdin -w)"
+
+	GIT_INDEX_FILE="$idx" gh_git update-index --add \
+		--cacheinfo 100644 "$GH_SESSION" session \
+		--cacheinfo 100644 "$cmd" command \
+		--cacheinfo 100644 "$usr" user \
+		--cacheinfo 100644 "$hst" host \
+		--cacheinfo 100644 "$pwd" pwd \
+		--cacheinfo 100644 "$env" environment || {
+		rm -f "$idx"
+		gh_die 'unable to write to temporary githtory index'
+		return 1
+	}
+
+	local tree="$(GIT_INDEX_FILE="$idx" gh_git write-tree)"
+	rm -f "$idx"
+	local commit="$(
+		if [ -n "$GH_LAST" ]; then
+			gh_git cat-file blob "$cmd" |
+			gh_git commit-tree "$tree" -p "$GH_LAST"
+		elif [ -n "$GH_BASE" ]; then
+			gh_git cat-file blob "$cmd" |
+			gh_git commit-tree "$tree" -p "$GH_BASE"
+		else
+			gh_git cat-file blob "$cmd" |
+			gh_git commit-tree "$tree"
+		fi
+	)"
+
+	local ref="$(gh_ref)"
+	if [ -n "$GH_LAST" ]; then
+		gh_git update-ref "$ref" "$commit" "$GH_LAST"
+	else
+		gh_git update-ref "$ref" "$commit" ''
+	fi
+
+	GH_NUM="$num"
+	GH_PWD="$PWD"
+	GH_ENV="$(env|base64)"
+	GH_LAST="$commit"
+}
+
+function gh_automerge(){
+	gh_initialized_or_die || return 1
+	gh_git for-each-ref --format='%(refname:short) %(objectname) %(tree)' refs/heads |
+	while read ref obj tree; do
+		local pid="${ref##*/}"
+		local stime="${ref#*/}"
+		stime="${stime%/$pid}"
+
+		printf '%s' "$pid" | grep -q '^[1-9][0-9]*$' || continue
+
+		local pspid="$(ps -o 'pid=' "$pid" 2>/dev/null)"
+		if [ -n "$pspid" ]; then
+			local pstime="$(date -d"$(ps -o 'lstart=' "$pid" 2>/dev/null)" +'%s' 2>/dev/null)"
+		else
+			local pstime=
+		fi
+
+		if [ "${pstime%??}" != "${stime%??}" ]; then
+			local combined="$(gh_git rev-parse --verify -q refs/heads/combined)"
+			if [ -z "$combined" ]; then
+				gh_git update-ref refs/heads/combined "$obj" '' || continue
+			else
+				local commit="$(echo | gh_git commit-tree "$tree" -p "$combined" -p "$obj")"
+				gh_git update-ref refs/heads/combined "$commit" "$combined" || continue
+			fi
+			gh_git update-ref -d "refs/heads/$ref" "$obj"
+		fi
+	done
+}
+
+gh_automerge
+if [ -z "$GH_BASE" -a -d "$GH_DIR" ]; then
+	GH_BASE="$(gh_git rev-list --all --date-order --reverse -1)"
+fi
+
+if [ "$PROMPT_COMMAND" = "${PROMPT_COMMAND/gh_append/}" ]; then
+    if [ -z "$PROMPT_COMMAND" ]; then
+        PROMPT_COMMAND="gh_append"
+    else
+        PROMPT_COMMAND="$PROMPT_COMMAND;gh_append"
+    fi
+fi
