@@ -136,6 +136,8 @@ function gh(){
 			[ -n "$ref" ] && GH_LAST="$(gh_git rev-parse --verify -q "$ref")"
 			;;
 		*)
+			[ "$1" = "log" ] && shift
+
 			local session_ref="$(gh_ref)"
 			local ref=
 			if \
