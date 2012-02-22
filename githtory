@@ -155,7 +155,7 @@ function gh(){
 
 			gh_git \
 				-c 'log.decorate=false' \
-				-c 'core.pager=cat' \
+				-c "core.pager=${GH_PAGER:-cat}" \
 				log --oneline --no-merges --reverse "$@" "$ref"
 		;;
 	esac
