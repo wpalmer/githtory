@@ -39,7 +39,7 @@ function gh_initialized_or_die(){
 }
 
 function gh(){
-	test -d "$GH_DIR" ||
+	test -d "$GH_DIR" || [ "$1" = "init" ] ||
 	{
 		gh_die 'githtory not initialized'
 		return 1
