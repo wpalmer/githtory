@@ -46,13 +46,13 @@ function gh(){
 	}
 
 	case "$1" in
-        init)
-            [ -d "$GH_DIR" ] && {
-                gh_die 'githtory already initialized'
-                return 1
-            }
-            gh_git init --bare
-            ;;
+		init)
+			[ -d "$GH_DIR" ] && {
+				gh_die 'githtory already initialized'
+				return 1
+			}
+			gh_git init --bare
+			;;
 		ready)
 			local id="$2"
 			local cmd="$(gh_git cat-file blob "$id:command")"
